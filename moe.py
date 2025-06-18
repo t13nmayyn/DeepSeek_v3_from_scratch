@@ -1,7 +1,7 @@
 import torch 
 from torch import nn 
 import torch.nn.functional as F 
-
+import math
 
 class Router(nn.Module):
     def __init__(self,n_expert,embd_dim,top_k):
@@ -32,18 +32,41 @@ class NoisyTopKRouter(nn.Module):
         self.n_expert=n_expert
         self.router=nn.Linear(self.embd_dim,self.n_expert,bias=False)
         self.noise_linear=nn.Linear(self.embd_dim,self.n_expert,bias=False)
+        # bais term for load balacing
+        self.bias=nn.Parameter(torch.zeros(self.n_expert))
+        self.bias_update_speed=0.001 
 
-    def forward(self,x): 
+        # normalize the weights 
+        nn.init.normal_(self.router.weight, mean=0.0, std=0.02 / math.sqrt(embd_dim))
+        nn.init.normal_(self.noise_linear.weight, mean=0.0, std=0.02 / math.sqrt(embd_dim))
+
+    def forward(self,x):
+
+        batch_size,seq_len,embed_dim=x.shape
+        # convering 3D to 2D
+        x_flat=x.view(-1,self.embd_dim)
+
         logits=self.router(x)
         noise_logits=self.noise_linear(x)
         # creating some noise for better distribution of token in the router 
         noise=torch.rand_like(logits)*F.softplus(noise_logits)
         # creating a noisy logit
-        noisy_logits=noise+logits
+        noisy_logits=noise+logits+self.bias
         zeros=torch.full_like(noisy_logits,fill_value=float('-inf'))
         topk_logits,indices=noisy_logits.topk(self.top_k,dim=-1)
         sparse_logits=zeros.scatter_(dim=-1,index=indices,src=topk_logits)
         probs=F.softmax(sparse_logits,dim=-1)
+
+        # load balancing : Auxillary loss free load balancing 
+        expert_selection_mask=F.one_hot(indices,self.n_expert).sum(1).float()
+        current_expert_load=expert_selection_mask.sum(0)
+        total_selection=x_flat.size(0)*self.top_k
+        avg_token_load_per_expert=total_selection/self.n_expert
+        load_voilation=avg_token_load_per_expert-current_expert_load
+        self.bias.data=self.bias.data+self.bias_update_speed*torch.sign(load_voilation)
+        probs=probs.view(batch_size,seq_len,self.n_expert)
+        indices=indices.view(batch_size,seq_len,self.top_k)
+
         return probs,indices
 
 router=NoisyTopKRouter(2,8,3)
@@ -80,6 +103,7 @@ class SparseMoE(nn.Module):
     def forward(self,x):
       batch_size,seq_len,embd_dim=x.shape
       probs,indices=self.router(x)
+      print('Probs : ',probs," \n probs.shape amd Indices",probs.shape,indices)
       #now converting the 3D Tensor into 2D Tensor
       x_flat=x.view(-1,x.size(-1))
       out=torch.zeros_like(x_flat)
@@ -116,6 +140,7 @@ class SparseMOElayer(nn.Module):
     self.router=Router(n_expert,embed_dim,top_K)
     self.top_K=top_K
     self.experts=nn.ModuleList([Expert(embed_dim,drop) for _ in range(n_expert)])
+    self.shared_expert=Expert(embd_dim=embed_dim,dropout=drop)
   def forward(self,x):
     batch_size,seq_len,embed_dim=x.shape
     probs,idx=self.router(x)
@@ -144,7 +169,9 @@ class SparseMOElayer(nn.Module):
       probs_selected=x_probs.view(-1,1) # keeping the last dim as 1 so the matrix can multiply the scalar 
 
       expert_out=expert(x_selected)
-      output[selected]=output[selected]+probs_selected*expert_out
+      #shared experts output 
+      shared_expert_out=self.shared_expert(x_selected)
+      output[selected]=output[selected]+probs_selected*expert_out + 0.1*shared_expert_out
     output=output.view(batch_size,seq_len,embed_dim)
     return output
 
